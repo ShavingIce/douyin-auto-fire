@@ -86,7 +86,7 @@ jobs:
                       f"账号 account{index} 的 DOUYIN_COOKIE_ACCOUNT{index} 与 "
                       f"DOUYIN_CONFIG_ACCOUNT{index} 必须同时配置"
                   )
-              # 提前校验，出错时直接指出是哪个 Secret，避免任务执行时才报错
+              # 提前校验，出错时直接指出是哪个 Secret，避免任务执行时才报错1
               try:
                   json.loads(cookie)
               except json.JSONDecodeError as exc:
