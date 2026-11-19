@@ -1,16 +1,16 @@
-name: Send Douyin Messages
+name: 发送抖音消息
 
 on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: Only verify login and friends without sending
+        description: 只验证登录和好友，不发送消息
         type: boolean
         default: false
-  # 使用 GitHub Actions 的日程时把下面三行注释删掉；用外部 cron 不用管
+  # GitHub 的 schedule 只有 cron 一个键，且一律按 UTC 解释，没有 timezone 字段。
+  # 北京时间每天 08:00 = UTC 00:00：
   # schedule:
   #   - cron: "0 0 * * *"
-  #     timezone: "Asia/Shanghai"
 
 concurrency:
   group: douyin-daily-sender
@@ -19,28 +19,282 @@ concurrency:
 jobs:
   send:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
-      DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
-      DOUYIN_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
-      DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-      DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
-      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-      WEBHOOK_HEADERS: ${{ secrets.WEBHOOK_HEADERS }}
-      WEBHOOK_TEMPLATE: ${{ secrets.WEBHOOK_TEMPLATE }}
       HEADLESS: "true"
+      # 诊断产物（Playwright trace / 截图 / history.json）含 Cookie 与私信内容，CI 里必须关掉
+      TRACE: "false"
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install -r requirements.txt
-      - run: python -m playwright install --with-deps chromium
-      - name: Write protected configuration
+          cache: pip
+
+      # ── 前置校验：只用标准库，10 秒内失败，不用等依赖装完 ──────────────
+      - name: Preflight - validate secrets
         shell: bash
-        run: printf '%s' "$DOUYIN_CONFIG" > config.json
+        env:
+          DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
+          DOUYIN_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
+          COOKIE_1: ${{ secrets.DOUYIN_COOKIE_ACCOUNT1 }}
+          CONFIG_1: ${{ secrets.DOUYIN_CONFIG_ACCOUNT1 }}
+          COOKIE_2: ${{ secrets.DOUYIN_COOKIE_ACCOUNT2 }}
+          CONFIG_2: ${{ secrets.DOUYIN_CONFIG_ACCOUNT2 }}
+          COOKIE_3: ${{ secrets.DOUYIN_COOKIE_ACCOUNT3 }}
+          CONFIG_3: ${{ secrets.DOUYIN_CONFIG_ACCOUNT3 }}
+          COOKIE_4: ${{ secrets.DOUYIN_COOKIE_ACCOUNT4 }}
+          CONFIG_4: ${{ secrets.DOUYIN_CONFIG_ACCOUNT4 }}
+          COOKIE_5: ${{ secrets.DOUYIN_COOKIE_ACCOUNT5 }}
+          CONFIG_5: ${{ secrets.DOUYIN_CONFIG_ACCOUNT5 }}
+        run: |
+          set -uo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          errors = []
+
+
+          def err(msg):
+              errors.append(msg)
+              print(f"::error::{msg}")
+
+
+          def note(msg):
+              print(f"::notice::{msg}")
+
+
+          def warn(msg):
+              print(f"::warning::{msg}")
+
+
+          def get(name):
+              return (os.environ.get(name) or "").strip()
+
+
+          def load_cookie(raw, label):
+              if not raw:
+                  return None
+              if "\n" not in raw and len(raw) < 4096:
+                  candidate = Path(raw).expanduser()
+                  try:
+                      if candidate.is_file():
+                          note(f"{label}: 按文件路径读取 {raw}")
+                          raw = candidate.read_text(encoding="utf-8")
+                  except OSError:
+                      pass
+
+              try:
+                  data = json.loads(raw)
+              except json.JSONDecodeError as exc:
+                  err(
+                      f"{label} 不是有效 JSON（第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}）。"
+                      "请用 Cookie-Editor 导出 JSON 后整段粘贴，前后不要加引号或反引号。"
+                  )
+                  return None
+
+              if not isinstance(data, list) or not data:
+                  err(label + " 解析结果不是非空数组。"
+                      "Cookie-Editor 导出的是顶层 JSON 数组，不是对象。")
+                  return None
+
+              names, domains, bad = set(), set(), 0
+              for item in data:
+                  if not isinstance(item, dict):
+                      bad += 1
+                      continue
+                  name = item.get("name")
+                  if isinstance(name, str):
+                      names.add(name)
+                  domain = item.get("domain") or item.get("host")
+                  if isinstance(domain, str):
+                      domains.add(domain)
+
+              if bad:
+                  err(f"{label} 中有 {bad} 项不是对象，格式不对。")
+
+              douyin = sorted(d for d in domains if "douyin" in d.lower())
+              if not douyin:
+                  err(
+                      f"{label} 里没有任何 douyin.com 域的 cookie（解析到 {len(domains)} 个域）。"
+                      "可能粘成了别的网站，或导出时不在抖音页面上。"
+                  )
+              else:
+                  note(f"{label}: {len(data)} 条 cookie，抖音域 {len(douyin)} 个，示例 {douyin[:3]}")
+
+              for key in ("sessionid", "sessionid_ss", "ttwid", "odin_tt", "passport_csrf_token"):
+                  if key in names:
+                      note(f"{label}: 含关键 cookie {key}")
+              if not ({"sessionid", "sessionid_ss"} & names):
+                  warn(f"{label} 里没有 sessionid / sessionid_ss，登录态可能不完整。")
+              return data
+
+
+          def load_task_config(raw, label):
+              if not raw:
+                  return None
+              try:
+                  data = json.loads(raw)
+              except json.JSONDecodeError as exc:
+                  err(
+                      f"{label} 不是有效 JSON（第 {exc.lineno} 行第 {exc.colno} 列：{exc.msg}）"
+                  )
+                  return None
+              if not isinstance(data, dict):
+                  err(label + " 必须是 JSON 对象")
+                  return None
+
+              targets = data.get("targets")
+              if targets is None and "friends" in data:
+                  friends = data.get("friends")
+                  messages = data.get("messages")
+                  if not isinstance(friends, list) or not friends:
+                      err(label + ": friends 必须是非空数组")
+                      return None
+                  if not isinstance(messages, list) or not messages:
+                      err(label + ": friends 模式需要非空的 messages 数组")
+                      return None
+                  note(f"{label}: friends 模式，{len(friends)} 个好友，{len(messages)} 条消息")
+                  return data
+
+              if not isinstance(targets, list) or not targets:
+                  err(label + ": 缺少 targets（或 friends），必须是非空数组")
+                  return None
+
+              stickers = data.get("stickers", {})
+              if not isinstance(stickers, dict):
+                  err(label + ": stickers 必须是对象（{名称: {路径或类型}}）")
+                  stickers = {}
+
+              total = 0
+              for i, target in enumerate(targets):
+                  if not isinstance(target, dict):
+                      err(f"{label}: targets[{i}] 必须是对象")
+                      continue
+                  name = target.get("name")
+                  if not isinstance(name, str) or not name.strip():
+                      err(f"{label}: targets[{i}].name 缺失或为空")
+                  messages = target.get("messages")
+                  if not isinstance(messages, list) or not messages:
+                      err(f"{label}: targets[{i}].messages 必须是非空数组")
+                      continue
+                  total += len(messages)
+                  for j, message in enumerate(messages):
+                      where = f"{label}: targets[{i}].messages[{j}]"
+                      if not isinstance(message, dict):
+                          err(where + " 必须是对象")
+                          continue
+                      mtype = message.get("type")
+                      if mtype not in ("text", "image", "douyin_sticker", "sticker", "random"):
+                          err(f"{where}.type 不支持: {mtype!r}（只认 text / image / douyin_sticker / sticker / random）")
+                          continue
+                      if mtype in ("douyin_sticker", "sticker"):
+                          key = message.get("sticker", message.get("value"))
+                          if not isinstance(key, str) or not key.strip():
+                              err(f"{where} 缺少 sticker 名称")
+                          elif key not in stickers:
+                              err(
+                                  f"{where}: 原生表情 {key!r} 未在内联 stickers 中配置"
+                                  "（多账号模式下程序不会读 config/stickers.json，必须内联）"
+                              )
+                      elif mtype == "random":
+                          choices = message.get("choices")
+                          if not isinstance(choices, list) or not choices:
+                              err(f"{where}.choices 必须是非空数组")
+
+              for key in ("continue_on_error", "prevent_duplicates"):
+                  if key in data and not isinstance(data[key], bool):
+                      err(f"{label}: {key} 必须是布尔值 true/false")
+
+              interval = data.get("send_interval_seconds") or {}
+              if isinstance(interval, dict) and "min" in interval and "max" in interval:
+                  try:
+                      if float(interval["min"]) > float(interval["max"]):
+                          err(label + ": send_interval_seconds.min 大于 max")
+                  except (TypeError, ValueError):
+                      err(label + ": send_interval_seconds 必须是数字")
+
+              note(f"{label}: {len(targets)} 个目标，共 {total} 条消息")
+              return data
+
+
+          cookie = get("DOUYIN_COOKIE")
+          config = get("DOUYIN_CONFIG")
+          pairs = [(i, get(f"COOKIE_{i}"), get(f"CONFIG_{i}")) for i in range(1, 6)]
+          multi = [(i, c, g) for i, c, g in pairs if c or g]
+
+          single_cookie = "已配置" if cookie else "未配置"
+          single_config = "已配置" if config else "未配置"
+          print("=" * 60)
+          print(f"单账号: cookie {single_cookie} / config {single_config}")
+          print(f"多账号: {len(multi)} 个账号条目")
+          print("=" * 60)
+
+          if multi:
+              for index, c, g in multi:
+                  if index == 1 and not c and not g:
+                      # account1 留空时，写入步骤会用 DOUYIN_COOKIE / DOUYIN_CONFIG 顶上，
+                      # 这里必须按同样的规则校验，否则旧账号的错配置会漏过前置检查。
+                      if cookie or config:
+                          note("account1 未配置，回落到 DOUYIN_COOKIE / DOUYIN_CONFIG")
+                          if not cookie or not config:
+                              err("用作 account1 的 DOUYIN_COOKIE / DOUYIN_CONFIG 必须同时配置")
+                          if cookie:
+                              load_cookie(cookie, "DOUYIN_COOKIE（account1）")
+                          if config:
+                              load_task_config(config, "DOUYIN_CONFIG（account1）")
+                      continue
+                  if not c or not g:
+                      err(
+                          f"account{index}: DOUYIN_COOKIE_ACCOUNT{index} 与 "
+                          f"DOUYIN_CONFIG_ACCOUNT{index} 必须同时配置"
+                      )
+                      continue
+                  load_cookie(c, f"DOUYIN_COOKIE_ACCOUNT{index}")
+                  load_task_config(g, f"DOUYIN_CONFIG_ACCOUNT{index}")
+          else:
+              if not cookie:
+                  err("DOUYIN_COOKIE 为空：单账号模式必须配置它（或改用 DOUYIN_COOKIE_ACCOUNTn）")
+              else:
+                  load_cookie(cookie, "DOUYIN_COOKIE")
+              if not config:
+                  err("DOUYIN_CONFIG 为空：单账号模式必须配置它（或改用 DOUYIN_CONFIG_ACCOUNTn）")
+              else:
+                  load_task_config(config, "DOUYIN_CONFIG")
+
+          if errors:
+              print()
+              print(f"::error::前置校验失败，共 {len(errors)} 项，逐条见上方 ::error:: 行")
+              sys.exit(1)
+
+          print("前置校验通过")
+          PY
+
+      - name: Install dependencies
+        run: |
+          set -euo pipefail
+          pip install -r requirements.txt
+          python -m playwright install --with-deps chromium
+
+      - name: Write single-account configuration
+        shell: bash
+        env:
+          CONFIG: ${{ secrets.DOUYIN_CONFIG }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CONFIG}" ]]; then
+            echo "未配置 DOUYIN_CONFIG，跳过单账号配置"
+            exit 0
+          fi
+          printf '%s' "$CONFIG" > config.json
+
       - name: Write multi-account configuration
         shell: bash
         env:
@@ -57,23 +311,31 @@ jobs:
           LEGACY_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
           LEGACY_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
         run: |
-          mkdir -p config/tasks
+          set -euo pipefail
+          mkdir -p config/tasks cookies
+          # 多账号配置在 config/tasks/ 下，程序只会在同一目录找 stickers.json
+          if [[ -f config/stickers.json ]]; then
+            cp -n config/stickers.json config/tasks/stickers.json || true
+          fi
           python - <<'PY'
           import json
           import os
           from pathlib import Path
 
-          if not any(os.environ.get(f"COOKIE_{i}") for i in range(1, 6)):
-              # 没有配置任何多账号 Secret（DOUYIN_COOKIE_ACCOUNTn）：
-              # 保持旧单账号模式，不生成 accounts.json。
-              print("未配置多账号 Secret，继续使用旧单账号模式")
+          Path("config/tasks").mkdir(parents=True, exist_ok=True)
+          Path("cookies").mkdir(parents=True, exist_ok=True)
+
+          has_multi = any(
+              os.environ.get(f"COOKIE_{i}") or os.environ.get(f"CONFIG_{i}")
+              for i in range(1, 6)
+          )
+          if not has_multi:
+              print("未配置多账号 Secret，使用单账号模式")
               raise SystemExit(0)
 
           accounts = []
           for index in range(1, 6):
               if index == 1 and not os.environ.get("COOKIE_1") and not os.environ.get("CONFIG_1"):
-                  # 没有配置 DOUYIN_COOKIE_ACCOUNT1 时，旧版 DOUYIN_COOKIE /
-                  # DOUYIN_CONFIG 自动作为账号1，方便老用户直接追加新账号。
                   cookie = os.environ.get("LEGACY_COOKIE")
                   config = os.environ.get("LEGACY_CONFIG")
               else:
@@ -86,7 +348,6 @@ jobs:
                       f"账号 account{index} 的 DOUYIN_COOKIE_ACCOUNT{index} 与 "
                       f"DOUYIN_CONFIG_ACCOUNT{index} 必须同时配置"
                   )
-              # 提前校验，出错时直接指出是哪个 Secret，避免任务执行时才报错1
               try:
                   json.loads(cookie)
               except json.JSONDecodeError as exc:
@@ -95,32 +356,67 @@ jobs:
                   json.loads(config)
               except json.JSONDecodeError as exc:
                   raise SystemExit(f"DOUYIN_CONFIG_ACCOUNT{index} 不是有效 JSON: {exc}") from exc
+
+              # Cookie 落盘、env 只写路径。
+              # 不能把 JSON 直接塞进 .env：python-dotenv 会对值做 `$` 变量展开，
+              # 例如 "a$b${c}" 会静默变成 "a$b"，导致登录失败且看不出原因。
+              cookie_file = Path("cookies") / f"account{index}.json"
+              cookie_file.write_text(cookie, encoding="utf-8")
               env_file = f".env.account{index}"
-              # Cookie 用 JSON 字符串转义后写入，dotenv 可精确还原，
-              # 兼容多行 Cookie JSON 与 # 等特殊字符
               Path(env_file).write_text(
-                  f"DOUYIN_COOKIE={json.dumps(cookie)}\nTASK_CONFIG=config/tasks/account{index}.json\n",
+                  f"DOUYIN_COOKIE={cookie_file.as_posix()}\n"
+                  f"TASK_CONFIG=config/tasks/account{index}.json\n",
                   encoding="utf-8",
               )
               Path(f"config/tasks/account{index}.json").write_text(config, encoding="utf-8")
               accounts.append({"id": f"account{index}", "enabled": True, "env_file": env_file})
+
           Path("config/accounts.json").write_text(
               json.dumps({"accounts": accounts}, ensure_ascii=False, indent=2),
               encoding="utf-8",
           )
+          print(f"已写入 {len(accounts)} 个账号配置")
           PY
+
       - name: Run
+        id: run
         shell: bash
+        # 失败不立刻中断，先让诊断上传跑完，最后再抛失败
+        continue-on-error: true
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_HEADERS: ${{ secrets.WEBHOOK_HEADERS }}
+          WEBHOOK_TEMPLATE: ${{ secrets.WEBHOOK_TEMPLATE }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+          set -uo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${DRY_RUN:-false}" == "true" ]]; then
+            echo "运行模式: dry-run（只验证登录与好友，不发送）"
             python run.py --dry-run
           else
+            echo "运行模式: 正式发送"
             python run.py
           fi
+
       - name: Upload diagnostics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: douyin-failure-${{ github.run_id }}
-          path: artifacts/
+          name: douyin-diagnostics-${{ github.run_id }}
+          # 只上传 run.log：它经过 app/privacy.py 脱敏（好友名→别名、Cookie 打码）。
+          # 绝不上传 traces/（含 Cookie 请求头）、screenshots/（含私信内容）、
+          # history.json 与 result.json（含好友真名）。
+          path: |
+            artifacts/run.log
+            artifacts/*/run.log
           retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Propagate failure
+        if: steps.run.outcome == 'failure'
+        run: |
+          echo "::error::run.py 执行失败，退出码非 0，详情见上方日志与 douyin-diagnostics artifact"
+          exit 1
