@@ -7,10 +7,10 @@ on:
         description: Only verify login and friends without sending
         type: boolean
         default: false
-  # 使用 GitHub Actions 的日程时把下面三行注释删掉；用外部 cron 不用管
+  # GitHub 的 schedule 只有 cron，且按 UTC 解释，没有 timezone 字段。
+  # 北京时间每天 08:00 = UTC 00:00：
   # schedule:
   #   - cron: "0 0 * * *"
-  #     timezone: "Asia/Shanghai"
 
 concurrency:
   group: douyin-daily-sender
@@ -19,28 +19,34 @@ concurrency:
 jobs:
   send:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
-      DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
-      DOUYIN_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
-      DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
-      DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
-      WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-      WEBHOOK_HEADERS: ${{ secrets.WEBHOOK_HEADERS }}
-      WEBHOOK_TEMPLATE: ${{ secrets.WEBHOOK_TEMPLATE }}
       HEADLESS: "true"
+      # 诊断产物（trace/截图/history）含 Cookie 与私信内容，CI 里必须关掉
+      TRACE: "false"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: pip
       - run: pip install -r requirements.txt
       - run: python -m playwright install --with-deps chromium
-      - name: Write protected configuration
+
+      - name: Write single-account configuration
         shell: bash
-        run: printf '%s' "$DOUYIN_CONFIG" > config.json
+        env:
+          CONFIG: ${{ secrets.DOUYIN_CONFIG }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CONFIG}" ]]; then
+            echo "::warning::未配置 DOUYIN_CONFIG，跳过单账号配置"
+            exit 0
+          fi
+          printf '%s' "$CONFIG" > config.json
+
       - name: Write multi-account configuration
         shell: bash
         env:
@@ -57,23 +63,25 @@ jobs:
           LEGACY_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
           LEGACY_CONFIG: ${{ secrets.DOUYIN_CONFIG }}
         run: |
-          mkdir -p config/tasks
+          set -euo pipefail
+          mkdir -p config/tasks cookies
+          cp -n config/stickers.json config/tasks/stickers.json 2>/dev/null || true
           python - <<'PY'
           import json
           import os
           from pathlib import Path
 
-          if not any(os.environ.get(f"COOKIE_{i}") for i in range(1, 6)):
-              # 没有配置任何多账号 Secret（DOUYIN_COOKIE_ACCOUNTn）：
-              # 保持旧单账号模式，不生成 accounts.json。
-              print("未配置多账号 Secret，继续使用旧单账号模式")
+          has_multi = any(
+              os.environ.get(f"COOKIE_{i}") or os.environ.get(f"CONFIG_{i}")
+              for i in range(1, 6)
+          )
+          if not has_multi:
+              print("未配置多账号 Secret，使用单账号模式")
               raise SystemExit(0)
 
           accounts = []
           for index in range(1, 6):
               if index == 1 and not os.environ.get("COOKIE_1") and not os.environ.get("CONFIG_1"):
-                  # 没有配置 DOUYIN_COOKIE_ACCOUNT1 时，旧版 DOUYIN_COOKIE /
-                  # DOUYIN_CONFIG 自动作为账号1，方便老用户直接追加新账号。
                   cookie = os.environ.get("LEGACY_COOKIE")
                   config = os.environ.get("LEGACY_CONFIG")
               else:
@@ -86,7 +94,6 @@ jobs:
                       f"账号 account{index} 的 DOUYIN_COOKIE_ACCOUNT{index} 与 "
                       f"DOUYIN_CONFIG_ACCOUNT{index} 必须同时配置"
                   )
-              # 提前校验，出错时直接指出是哪个 Secret，避免任务执行时才报错
               try:
                   json.loads(cookie)
               except json.JSONDecodeError as exc:
@@ -95,32 +102,57 @@ jobs:
                   json.loads(config)
               except json.JSONDecodeError as exc:
                   raise SystemExit(f"DOUYIN_CONFIG_ACCOUNT{index} 不是有效 JSON: {exc}") from exc
+
+              # Cookie 落盘、env 只写路径：避免 dotenv 的 $ 变量展开改写 cookie
+              cookie_file = Path("cookies") / f"account{index}.json"
+              cookie_file.write_text(cookie, encoding="utf-8")
               env_file = f".env.account{index}"
-              # Cookie 用 JSON 字符串转义后写入，dotenv 可精确还原，
-              # 兼容多行 Cookie JSON 与 # 等特殊字符
               Path(env_file).write_text(
-                  f"DOUYIN_COOKIE={json.dumps(cookie)}\nTASK_CONFIG=config/tasks/account{index}.json\n",
+                  f"DOUYIN_COOKIE={cookie_file.as_posix()}\n"
+                  f"TASK_CONFIG=config/tasks/account{index}.json\n",
                   encoding="utf-8",
               )
               Path(f"config/tasks/account{index}.json").write_text(config, encoding="utf-8")
               accounts.append({"id": f"account{index}", "enabled": True, "env_file": env_file})
+
           Path("config/accounts.json").write_text(
               json.dumps({"accounts": accounts}, ensure_ascii=False, indent=2),
               encoding="utf-8",
           )
           PY
+
       - name: Run
+        id: run
         shell: bash
+        continue-on-error: true
+        env:
+          DRY_RUN: ${{ inputs.dry_run }}
+          DOUYIN_COOKIE: ${{ secrets.DOUYIN_COOKIE }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_HEADERS: ${{ secrets.WEBHOOK_HEADERS }}
+          WEBHOOK_TEMPLATE: ${{ secrets.WEBHOOK_TEMPLATE }}
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.dry_run }}" == "true" ]]; then
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${DRY_RUN:-false}" == "true" ]]; then
             python run.py --dry-run
           else
             python run.py
           fi
+
       - name: Upload diagnostics
-        if: failure()
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: douyin-failure-${{ github.run_id }}
-          path: artifacts/
+          name: douyin-diagnostics-${{ github.run_id }}
+          path: |
+            artifacts/**/run.log
+            artifacts/**/result.json
+            artifacts/**/metrics.json
           retention-days: 3
+          if-no-files-found: ignore
+
+      - name: Propagate failure
+        if: steps.run.outcome == 'failure'
+        run: exit 1
